@@ -1,4 +1,5 @@
 # ZeroTrust CyberShield XAI
+![CI](https://github.com/rahman1114/zerotrust-cybershield-xai-_/actions/workflows/ci.yml/badge.svg)
 
 **An open-source explainable AI framework for adaptive cyber defense.**
 
