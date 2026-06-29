@@ -1,116 +1,82 @@
-"""Adaptive cyber defense.
+"""Synthetic, privacy-safe network traffic generation.
 
-A core idea in Zero Trust security is *continuous verification*: the system
-never assumes a fixed level of trust and keeps adapting as new evidence
-arrives. This module brings that idea to the detector's decision boundary.
-
-:class:`AdaptiveDefender` wraps a fitted :class:`AnomalyDetector` and lets a
-security analyst feed back verdicts on individual alerts ("this was a real
-attack" / "this was a false alarm"). It uses that feedback to nudge the
-detection threshold:
-
-* too many confirmed **false positives** -> become *stricter* (flag less),
-* a **missed attack** (false negative) -> become *more sensitive* (flag more).
-
-This produces a defense posture that adapts to the live environment instead of
-staying frozen at training time.
+Provides a deterministic generator of labelled network-flow records so the
+toolkit can be developed, tested, and benchmarked without ever touching real
+or sensitive data. This is the privacy-preserving foundation of the project.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
-from .detector import AnomalyDetector
+FEATURE_COLUMNS = [
+    "duration",
+    "src_bytes",
+    "dst_bytes",
+    "packet_count",
+    "failed_logins",
+    "unique_ports",
+    "bytes_per_packet",
+    "night_activity",
+]
+
+LABEL_COLUMN = "is_attack"
 
 
 @dataclass
-class FeedbackStats:
-    """Running tally of analyst feedback."""
+class TrafficConfig:
+    """Configuration for synthetic traffic generation."""
 
-    true_positives: int = 0
-    false_positives: int = 0
-    false_negatives: int = 0
-    threshold_history: list[float] = field(default_factory=list)
-
-    def total_feedback(self) -> int:
-        return self.true_positives + self.false_positives + self.false_negatives
-
-    def to_text(self) -> str:
-        return (
-            "Adaptive feedback summary\n"
-            f"  confirmed attacks (TP)    : {self.true_positives}\n"
-            f"  false alarms (FP)         : {self.false_positives}\n"
-            f"  missed attacks (FN)       : {self.false_negatives}\n"
-            f"  threshold adjustments     : {len(self.threshold_history)}"
-        )
+    n_normal: int = 1800
+    n_attacks: int = 200
+    seed: int = 42
 
 
-class AdaptiveDefender:
-    """Wraps a detector with feedback-driven, Zero-Trust-style adaptation."""
+def generate_traffic(config: TrafficConfig | None = None) -> pd.DataFrame:
+    """Generate a labelled, privacy-safe synthetic network-flow dataset."""
+    config = config or TrafficConfig()
+    rng = np.random.default_rng(config.seed)
 
-    def __init__(
-        self,
-        detector: AnomalyDetector,
-        step: float = 0.01,
-        min_threshold: float = -1.0,
-        max_threshold: float = 1.0,
-    ) -> None:
-        if detector.threshold is None:
-            raise RuntimeError("Detector must be fitted before adaptive defense.")
-        self.detector = detector
-        self.step = step
-        self.min_threshold = min_threshold
-        self.max_threshold = max_threshold
-        self.stats = FeedbackStats(threshold_history=[detector.threshold])
+    normal = pd.DataFrame({
+        "duration": rng.normal(30, 10, config.n_normal).clip(1),
+        "src_bytes": rng.normal(4000, 1200, config.n_normal).clip(50),
+        "dst_bytes": rng.normal(3500, 1000, config.n_normal).clip(50),
+        "packet_count": rng.normal(40, 12, config.n_normal).clip(1),
+        "failed_logins": rng.poisson(0.3, config.n_normal),
+        "unique_ports": rng.poisson(2, config.n_normal) + 1,
+        "night_activity": rng.binomial(1, 0.15, config.n_normal),
+        LABEL_COLUMN: 0,
+    })
 
-    # ------------------------------------------------------------------ #
-    # Feedback handlers
-    # ------------------------------------------------------------------ #
-    def register_false_positive(self, count: int = 1) -> None:
-        """Analyst confirmed an alert was a false alarm -> become stricter."""
-        self.stats.false_positives += count
-        # Lower the raw-score threshold so fewer records get flagged.
-        self._shift_threshold(-self.step * count)
+    attacks = pd.DataFrame({
+        "duration": rng.normal(120, 45, config.n_attacks).clip(1),
+        "src_bytes": rng.normal(250000, 80000, config.n_attacks).clip(1000),
+        "dst_bytes": rng.normal(20000, 8000, config.n_attacks).clip(100),
+        "packet_count": rng.normal(250, 90, config.n_attacks).clip(1),
+        "failed_logins": rng.poisson(8, config.n_attacks),
+        "unique_ports": rng.poisson(20, config.n_attacks) + 3,
+        "night_activity": rng.binomial(1, 0.75, config.n_attacks),
+        LABEL_COLUMN: 1,
+    })
 
-    def register_false_negative(self, count: int = 1) -> None:
-        """A real attack slipped through -> become more sensitive."""
-        self.stats.false_negatives += count
-        # Raise the raw-score threshold so more records get flagged.
-        self._shift_threshold(self.step * count)
+    data = pd.concat([normal, attacks], ignore_index=True)
+    data["bytes_per_packet"] = data["src_bytes"] / data["packet_count"]
+    return data.sample(frac=1, random_state=config.seed).reset_index(drop=True)
 
-    def register_true_positive(self, count: int = 1) -> None:
-        """Analyst confirmed a correct alert -> no change, just record it."""
-        self.stats.true_positives += count
 
-    def apply_feedback(self, data: pd.DataFrame, truth_column: str) -> FeedbackStats:
-        """Batch-learn from a labelled slice of recently reviewed alerts.
+def train_test_split_traffic(
+    data: pd.DataFrame, test_frac: float = 0.30, seed: int = 42
+):
+    """Split into train (normal only) and test (mixed) sets.
 
-        ``data`` must contain the feature columns plus a ground-truth column
-        (1 = real attack, 0 = benign). The defender compares its predictions
-        against the truth and adapts accordingly.
-        """
-        if truth_column not in data.columns:
-            raise ValueError(f"'{truth_column}' column not found for feedback.")
-
-        preds = self.detector.predict(data)
-        truth = data[truth_column].to_numpy()
-
-        for p, t in zip(preds, truth):
-            if p == 1 and t == 1:
-                self.register_true_positive()
-            elif p == 1 and t == 0:
-                self.register_false_positive()
-            elif p == 0 and t == 1:
-                self.register_false_negative()
-        return self.stats
-
-    # ------------------------------------------------------------------ #
-    # Internals
-    # ------------------------------------------------------------------ #
-    def _shift_threshold(self, delta: float) -> None:
-        current = self.detector.threshold or 0.0
-        new = max(self.min_threshold, min(self.max_threshold, current + delta))
-        self.detector.set_threshold(new)
-        self.stats.threshold_history.append(new)
+    The detector trains unsupervised on normal traffic, so the training split
+    keeps only benign records; the test split keeps the natural mix for
+    evaluation.
+    """
+    test = data.sample(frac=test_frac, random_state=seed)
+    train = data.drop(test.index)
+    train = train[train[LABEL_COLUMN] == 0]
+    return train.reset_index(drop=True), test.reset_index(drop=True)
